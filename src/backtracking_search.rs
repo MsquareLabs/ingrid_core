@@ -872,7 +872,9 @@ pub fn find_fill_with_options(
 
 #[cfg(test)]
 mod tests {
-    use crate::backtracking_search::{find_fill, FillFailure};
+    use crate::backtracking_search::{
+        find_fill, find_fill_with_options, find_fill_with_seed, FillFailure, FillOptions,
+    };
     use crate::grid_config::{
         generate_grid_config_from_template_string, render_grid, OwnedGridConfig,
     };
@@ -1343,5 +1345,68 @@ mod tests {
             "{}",
             render_grid(&grid_config.to_config_ref(), &result.choices)
         );
+    }
+
+    #[test]
+    fn test_seeded_fills_are_reproducible_and_differ_by_seed() {
+        let grid_config = generate_config(
+            "
+            #...###
+            #....##
+            .......
+            .......
+            .......
+            ##....#
+            ###...#
+            ",
+        );
+        let config = grid_config.to_config_ref();
+        let fill_with_seed = |seed| {
+            let result =
+                find_fill_with_seed(&config, None, None, seed).expect("Failed to find a fill");
+            render_grid(&config, &result.choices)
+        };
+
+        let unseeded = find_fill(&config, None, None).expect("Failed to find a fill");
+        assert_eq!(
+            fill_with_seed(None),
+            render_grid(&config, &unseeded.choices)
+        );
+        assert_eq!(fill_with_seed(Some(1)), fill_with_seed(Some(1)));
+        assert_ne!(fill_with_seed(Some(1)), fill_with_seed(Some(2)));
+    }
+
+    #[test]
+    fn test_max_retries_caps_the_number_of_restarts() {
+        // Without a cap, this grid takes exactly one restart to fill.
+        let grid_config = generate_config(
+            "
+            ......
+            ......
+            ......
+            ......
+            ......
+            ......
+            ",
+        );
+        let config = grid_config.to_config_ref();
+        let fill_with_max_retries = |max_retries| {
+            find_fill_with_options(
+                &config,
+                None,
+                None,
+                FillOptions {
+                    max_retries: Some(max_retries),
+                    ..FillOptions::default()
+                },
+            )
+        };
+
+        assert!(matches!(
+            fill_with_max_retries(0),
+            Err(FillFailure::ExceededBacktrackLimit(_))
+        ));
+        let result = fill_with_max_retries(1).expect("Failed to find a fill");
+        assert_eq!(result.statistics.retries, 1);
     }
 }

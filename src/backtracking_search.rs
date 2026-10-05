@@ -709,6 +709,58 @@ pub fn find_fill(
     timeout: Option<Duration>,
     elimination_sets: Option<&mut [EliminationSet]>,
 ) -> Result<FillSuccess, FillFailure> {
+    find_fill_with_seed(config, timeout, elimination_sets, None)
+}
+
+/// Derive the RNG seed for a given retry. With no seed this is just the retry number, matching the
+/// behavior of `find_fill`; a seed offsets every retry's RNG stream so that different seeds explore
+/// different fills, while the same seed always reproduces the same search.
+fn rng_seed_for_retry(seed: Option<u64>, retry_num: u64) -> u64 {
+    seed.map_or(retry_num, |seed| {
+        seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(retry_num)
+    })
+}
+
+/// Like `find_fill`, but with an optional seed for the search's random choices. `None` behaves
+/// exactly like `find_fill`; `Some(seed)` gives a different but reproducible fill for each seed.
+#[allow(dead_code)]
+pub fn find_fill_with_seed(
+    config: &GridConfig,
+    timeout: Option<Duration>,
+    elimination_sets: Option<&mut [EliminationSet]>,
+    seed: Option<u64>,
+) -> Result<FillSuccess, FillFailure> {
+    find_fill_with_options(
+        config,
+        timeout,
+        elimination_sets,
+        FillOptions {
+            seed,
+            max_retries: None,
+        },
+    )
+}
+
+/// Extra knobs for `find_fill_with_options`. The default matches `find_fill`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FillOptions {
+    /// Offsets the RNG seed of every restart; `None` matches `find_fill`.
+    pub seed: Option<u64>,
+    /// Give up with `ExceededBacktrackLimit` after this many restarts. Unlike `timeout`, this
+    /// budget doesn't depend on machine speed, so the outcome is reproducible.
+    pub max_retries: Option<u64>,
+}
+
+/// Like `find_fill`, configured by `FillOptions`.
+#[allow(dead_code)]
+pub fn find_fill_with_options(
+    config: &GridConfig,
+    timeout: Option<Duration>,
+    elimination_sets: Option<&mut [EliminationSet]>,
+    options: FillOptions,
+) -> Result<FillSuccess, FillFailure> {
+    let FillOptions { seed, max_retries } = options;
     let start = Instant::now();
     let deadline = timeout.map(|timeout| start + timeout);
 
@@ -790,7 +842,7 @@ pub fn find_fill(
             &slots,
             deadline,
             max_backtracks,
-            retry_num,
+            rng_seed_for_retry(seed, retry_num),
             &mut crossing_weights,
             elimination_sets,
         ) {
@@ -801,7 +853,10 @@ pub fn find_fill(
                 result.statistics.initial_arc_consistency_time = initial_arc_consistency_time;
                 return Ok(result);
             }
-            Err(FillFailure::ExceededBacktrackLimit(_backtrack_count)) => {
+            Err(FillFailure::ExceededBacktrackLimit(backtrack_count)) => {
+                if max_retries.is_some_and(|max_retries| retry_num >= max_retries) {
+                    return Err(FillFailure::ExceededBacktrackLimit(backtrack_count));
+                }
                 // Ensure that we always increase `max_backtracks` by at least 1.
                 max_backtracks = (max_backtracks + 1)
                     .max((max_backtracks as f32 * RETRY_GROWTH_FACTOR) as usize);
@@ -817,7 +872,9 @@ pub fn find_fill(
 
 #[cfg(test)]
 mod tests {
-    use crate::backtracking_search::{find_fill, FillFailure};
+    use crate::backtracking_search::{
+        find_fill, find_fill_with_options, find_fill_with_seed, FillFailure, FillOptions,
+    };
     use crate::grid_config::{
         generate_grid_config_from_template_string, render_grid, OwnedGridConfig,
     };
@@ -1288,5 +1345,68 @@ mod tests {
             "{}",
             render_grid(&grid_config.to_config_ref(), &result.choices)
         );
+    }
+
+    #[test]
+    fn test_seeded_fills_are_reproducible_and_differ_by_seed() {
+        let grid_config = generate_config(
+            "
+            #...###
+            #....##
+            .......
+            .......
+            .......
+            ##....#
+            ###...#
+            ",
+        );
+        let config = grid_config.to_config_ref();
+        let fill_with_seed = |seed| {
+            let result =
+                find_fill_with_seed(&config, None, None, seed).expect("Failed to find a fill");
+            render_grid(&config, &result.choices)
+        };
+
+        let unseeded = find_fill(&config, None, None).expect("Failed to find a fill");
+        assert_eq!(
+            fill_with_seed(None),
+            render_grid(&config, &unseeded.choices)
+        );
+        assert_eq!(fill_with_seed(Some(1)), fill_with_seed(Some(1)));
+        assert_ne!(fill_with_seed(Some(1)), fill_with_seed(Some(2)));
+    }
+
+    #[test]
+    fn test_max_retries_caps_the_number_of_restarts() {
+        // Without a cap, this grid takes exactly one restart to fill.
+        let grid_config = generate_config(
+            "
+            ......
+            ......
+            ......
+            ......
+            ......
+            ......
+            ",
+        );
+        let config = grid_config.to_config_ref();
+        let fill_with_max_retries = |max_retries| {
+            find_fill_with_options(
+                &config,
+                None,
+                None,
+                FillOptions {
+                    max_retries: Some(max_retries),
+                    ..FillOptions::default()
+                },
+            )
+        };
+
+        assert!(matches!(
+            fill_with_max_retries(0),
+            Err(FillFailure::ExceededBacktrackLimit(_))
+        ));
+        let result = fill_with_max_retries(1).expect("Failed to find a fill");
+        assert_eq!(result.statistics.retries, 1);
     }
 }

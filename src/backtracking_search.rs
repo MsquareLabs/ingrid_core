@@ -709,6 +709,58 @@ pub fn find_fill(
     timeout: Option<Duration>,
     elimination_sets: Option<&mut [EliminationSet]>,
 ) -> Result<FillSuccess, FillFailure> {
+    find_fill_with_seed(config, timeout, elimination_sets, None)
+}
+
+/// Derive the RNG seed for a given retry. With no seed this is just the retry number, matching the
+/// behavior of `find_fill`; a seed offsets every retry's RNG stream so that different seeds explore
+/// different fills, while the same seed always reproduces the same search.
+fn rng_seed_for_retry(seed: Option<u64>, retry_num: u64) -> u64 {
+    seed.map_or(retry_num, |seed| {
+        seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(retry_num)
+    })
+}
+
+/// Like `find_fill`, but with an optional seed for the search's random choices. `None` behaves
+/// exactly like `find_fill`; `Some(seed)` gives a different but reproducible fill for each seed.
+#[allow(dead_code)]
+pub fn find_fill_with_seed(
+    config: &GridConfig,
+    timeout: Option<Duration>,
+    elimination_sets: Option<&mut [EliminationSet]>,
+    seed: Option<u64>,
+) -> Result<FillSuccess, FillFailure> {
+    find_fill_with_options(
+        config,
+        timeout,
+        elimination_sets,
+        FillOptions {
+            seed,
+            max_retries: None,
+        },
+    )
+}
+
+/// Extra knobs for `find_fill_with_options`. The default matches `find_fill`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FillOptions {
+    /// Offsets the RNG seed of every restart; `None` matches `find_fill`.
+    pub seed: Option<u64>,
+    /// Give up with `ExceededBacktrackLimit` after this many restarts. Unlike `timeout`, this
+    /// budget doesn't depend on machine speed, so the outcome is reproducible.
+    pub max_retries: Option<u64>,
+}
+
+/// Like `find_fill`, configured by `FillOptions`.
+#[allow(dead_code)]
+pub fn find_fill_with_options(
+    config: &GridConfig,
+    timeout: Option<Duration>,
+    elimination_sets: Option<&mut [EliminationSet]>,
+    options: FillOptions,
+) -> Result<FillSuccess, FillFailure> {
+    let FillOptions { seed, max_retries } = options;
     let start = Instant::now();
     let deadline = timeout.map(|timeout| start + timeout);
 
@@ -790,7 +842,7 @@ pub fn find_fill(
             &slots,
             deadline,
             max_backtracks,
-            retry_num,
+            rng_seed_for_retry(seed, retry_num),
             &mut crossing_weights,
             elimination_sets,
         ) {
@@ -801,7 +853,10 @@ pub fn find_fill(
                 result.statistics.initial_arc_consistency_time = initial_arc_consistency_time;
                 return Ok(result);
             }
-            Err(FillFailure::ExceededBacktrackLimit(_backtrack_count)) => {
+            Err(FillFailure::ExceededBacktrackLimit(backtrack_count)) => {
+                if max_retries.is_some_and(|max_retries| retry_num >= max_retries) {
+                    return Err(FillFailure::ExceededBacktrackLimit(backtrack_count));
+                }
                 // Ensure that we always increase `max_backtracks` by at least 1.
                 max_backtracks = (max_backtracks + 1)
                     .max((max_backtracks as f32 * RETRY_GROWTH_FACTOR) as usize);
